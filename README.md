@@ -26,7 +26,7 @@ batch of IDs ─► TierManager
 - Two-tier embedding store: in-memory LRU hot tier + RocksDB cold tier
 - INT8 quantization of embedding rows with a per-row scale
 
-Course topics covered: data locality and memory (L2, L3), key-value stores (L6), quantization (L16).
+Course topics covered: data locality and memory, key-value stores, quantization.
 
 ## Experiments
 
@@ -43,7 +43,7 @@ Key plots: hit rate vs hot-tier size, memory vs AUC (FP32 vs INT8).
 
 Moved out of the current scope; we attempt these only after the core is done and measured.
 
-- **Dynamic batching** in a serving API (model serving, L23)
+- **Dynamic batching** in a serving API (model serving)
 - **C++ hot tier** with pybind11, and a Python-vs-C++ comparison
 - **Eviction policy comparison:** LRU vs frequency-based
 - **Store INT8 rows in the tiers** directly instead of dequantizing offline
