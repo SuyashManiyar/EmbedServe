@@ -55,6 +55,9 @@ Moved out of the current scope; we attempt these only after the core is done and
 embedserve/
   tiers.py      Hot tier, cold tiers (in-memory and RocksDB), TierManager
   quantize.py   FP32 → INT8 quantizer with a per-row scale
+  data.py       Criteo CSV loader, per-table vocabulary, access-skew stats
+scripts/
+  prepare_data.py   Encode Criteo subsets into data/processed/*.npz
 tests/          pytest suite
 ```
 
