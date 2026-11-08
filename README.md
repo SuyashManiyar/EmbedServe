@@ -56,8 +56,10 @@ embedserve/
   tiers.py      Hot tier, cold tiers (in-memory and RocksDB), TierManager
   quantize.py   FP32 → INT8 quantizer with a per-row scale
   data.py       Criteo CSV loader, per-table vocabulary, access-skew stats
+  model.py      Small DLRM; can run from embeddings fetched by any store
 scripts/
   prepare_data.py   Encode Criteo subsets into data/processed/*.npz
+  train.py          Train the DLRM once; saves weights + FP32 tables to data/model/
 tests/          pytest suite
 ```
 
