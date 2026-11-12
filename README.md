@@ -19,7 +19,7 @@ AUC is only a correctness check. Results are systems numbers: hit rate, p99 late
 | 0 | Core store: LRU hot tier, RocksDB cold tier, `TierManager`, INT8 quantizer | ✅ Done |
 | 1 | Data: Criteo subset → encoded arrays + access-skew stats | ✅ Done |
 | 2 | Model: train a DLRM once on CPU, save weights and FP32 tables | ✅ Done (AUC 0.7996) |
-| 3 | Evaluation harness: serve the fixed model from FP32 / INT8 / two-tier store; measure AUC, memory, hit rate, p50/p99 latency | ⏳ Next |
+| 3 | Evaluation harness: FP32, INT8 and two-tier serving with AUC, embedding payload bytes, hit rate and batch p50/p99 latency | Implemented |
 | 4 | Experiments + plots (see [Experiments](#experiments)) | Not started |
 | 5 | Write-up for the Nov 18 milestone | Not started |
 
@@ -117,6 +117,22 @@ Everyone should get the same encoded data. Training is seeded (`--seed 0`) but f
 results can differ slightly across machines, so for experiments we compare runs from **one**
 trained model.
 
+### 5. Evaluate the saved model
+
+```bash
+python scripts/evaluate.py --rows 10000
+```
+
+Evaluates FP32, INT8 and two-tier serving on the first 10,000 validation rows.
+Omit `--rows` to use the complete validation file. The default two-tier cache
+holds 12,574 rows. `--hot-capacities` accepts multiple capacities for separate
+runs. Results are saved to `experiments/results/evaluation.json`.
+
+The report includes AUC, log loss, batch lookup and inference latency, cache
+statistics and embedding payload bytes. Payload bytes exclude process and
+RocksDB overhead. See [Evaluation](docs/evaluation.md) for measurement definitions,
+warmup behavior and cache capacity comparisons.
+
 ## Results so far
 
 All on the 5M-row train / 1M-row validation subset.
@@ -182,11 +198,15 @@ Moved out of the current scope; we attempt these only after the core is done and
 embedserve/
   tiers.py      Hot tier, cold tiers (in-memory and RocksDB), TierManager
   quantize.py   FP32 → INT8 quantizer with a per-row scale
+  serving.py    FP32, INT8 and RocksDB embedding stores
+  evaluation.py Accuracy and batch latency measurements
   data.py       Criteo CSV loader, per-table vocabulary, access-skew stats
   model.py      Small DLRM; can run from embeddings fetched by any store
 scripts/
   prepare_data.py   Encode Criteo subsets into data/processed/*.npz
   train.py          Train the DLRM once; saves weights + FP32 tables to data/model/
+  evaluate.py       Evaluate a checkpoint across embedding stores
+docs/           Evaluation commands and metric definitions
 tests/          pytest suite (runs on synthetic data, no download needed)
 data/           gitignored: CSVs, processed arrays, trained model
 ```
