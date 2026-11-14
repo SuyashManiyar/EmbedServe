@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,11 +8,14 @@ version = "0.1.0"
 description = "Two-tier, quantized embedding store for serving a DLRM-style recommender"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = ["numpy>=1.26", "pandas>=2.2", "rocksdict>=0.3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 model = ["torch>=2.2", "scikit-learn>=1.4"]
+plots = ["matplotlib>=3.8"]
 
 [tool.setuptools]
 packages = ["embedserve"]
