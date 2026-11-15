@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from embedserve import InMemoryColdTier, RocksDBColdTier, TierManager
+from embedserve import InMemoryColdTier, RocksDBColdTier, TierManager, dequantize_int8, quantize_int8
 from embedserve.tiers import cpp_available
 
 pytestmark = pytest.mark.skipif(not cpp_available(), reason="C++ extension not built")
@@ -64,9 +64,12 @@ def test_batch_larger_than_capacity_keeps_most_recent_misses():
 
 
 @pytest.mark.parametrize("capacity", [0, 1, 7, 50, 1000])
-def test_lookup_fields_matches_python(capacity):
-    py, data = loaded(lambda: InMemoryColdTier(DIM), capacity, "python")
-    cc, _ = loaded(lambda: InMemoryColdTier(DIM), capacity, "cpp")
+@pytest.mark.parametrize("row_format", ["fp32", "int8"])
+def test_lookup_fields_matches_python(capacity, row_format):
+    py, data = loaded(lambda: InMemoryColdTier(DIM, row_format), capacity, "python")
+    cc, _ = loaded(lambda: InMemoryColdTier(DIM, row_format), capacity, "cpp")
+    if row_format == "int8":
+        data = np.stack([dequantize_int8(*quantize_int8(t)) for t in data])
     rng = np.random.default_rng(100 + capacity)
     for _ in range(40):
         ids = np.minimum(rng.zipf(1.3, size=(int(rng.integers(0, 60)), 3)) - 1, 220)

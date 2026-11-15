@@ -85,3 +85,20 @@ def test_negative_capacity_fails(tables, tmp_path):
     with pytest.raises(ValueError, match="nonnegative"):
         TwoTierStore(tables, -1, tmp_path)
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("backend", ["python", "cpp"])
+def test_int8_tiers_match_int8_store(tables, tmp_path, backend):
+    ids = np.array([[0, 6], [4, 0], [0, 6], [3, 2]])
+    with INT8Store(tables) as reference, \
+            TwoTierStore(tables, 3, tmp_path, backend, row_format="int8") as store:
+        for _ in range(3):  # cold reads, then hot hits, both dequantized the same way
+            np.testing.assert_array_equal(store.lookup(ids), reference.lookup(ids))
+        assert store.stats()["row_format"] == "int8"
+        assert store.payload_bytes == 3 * (8 + 4)
+
+
+def test_unknown_row_format_fails(tables, tmp_path):
+    with pytest.raises(ValueError, match="row_format"):
+        TwoTierStore(tables, 3, tmp_path, row_format="int4")
+    assert list(tmp_path.iterdir()) == []

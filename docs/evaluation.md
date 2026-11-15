@@ -77,6 +77,47 @@ output. They give identical rows, hit and miss counts and LRU contents (checked 
 `scripts/plot_results.py` merges repeats, reporting the median of each latency statistic
 and its range.
 
+## Row formats
+
+`--row-formats` selects what the two-tier store keeps in both tiers: `fp32` rows (4 × dim
+bytes) or `int8` rows (dim INT8 values plus one FP32 scale). INT8 rows are dequantized on
+read and give exactly the output of `INT8Store`. Each run reports `row_format`.
+
+## Exported stores
+
+`scripts/export_store.py` writes a serving directory, `data/store/` by default. With
+`--store`, `evaluate.py` opens stores from it instead of loading the checkpoint, and two-tier
+runs open the exported RocksDB database read-only instead of building one. An opened database
+is reused across runs, so the OS file cache may already hold it.
+
+## Process memory
+
+`scripts/measure_memory.py` serves each store in a fresh process that loads only the MLP
+weights and that store, then records two values:
+
+- **Peak footprint**: memory the process owns and the OS cannot drop. On macOS this is the
+  kernel's lifetime peak physical footprint; elsewhere it is the peak unique set size.
+- **Peak RSS**: resident memory, which also counts file-backed pages such as SST files read
+  through mmap.
+
+A run with no store gives the baseline for Python, PyTorch, the MLPs and the input data.
+`--no-mmap` adds two-tier runs that read through RocksDB's block cache instead of mmap.
+
+## Request serving
+
+`scripts/benchmark_serving.py` measures the dynamic batcher (`embedserve/batching.py`). One
+generator thread submits single requests at a target rate with Poisson arrivals and never
+waits for results. Latency runs from submit to result, so it includes time queued.
+
+- **Achieved rate** is completed requests divided by the time from the first send to the
+  last result. A point is marked saturated when it is below 95% of the offered rate.
+- **Mean batch** is requests served divided by batches dispatched.
+- **Send lag** is how late the generator sent requests against its schedule. Large values
+  mean the generator, not only the server, was overloaded.
+
+`--max-batch-sizes 1` serves every request alone. The generator shares the server's process
+and GIL, so the highest achieved rate is a lower bound on server capacity.
+
 ## Measurements
 
 AUC and log loss cover every selected row once, including the final partial

@@ -32,11 +32,14 @@ class DLRM(nn.Module):
         n_dense: int = 13,
         bottom: tuple[int, ...] = (512, 256),
         top: tuple[int, ...] = (512, 256),
+        embeddings: bool = True,
     ):
+        """With embeddings=False no tables are allocated; use `forward_from_embeddings`."""
         super().__init__()
         self.table_sizes = list(table_sizes)
         self.dim = dim
-        self.embeddings = nn.ModuleList(nn.Embedding(n, dim, sparse=True) for n in table_sizes)
+        self.embeddings = nn.ModuleList(
+            nn.Embedding(n, dim, sparse=True) for n in (table_sizes if embeddings else []))
         for emb in self.embeddings:
             # DLRM reference init: U(-1/sqrt(n), 1/sqrt(n))
             bound = 1.0 / emb.num_embeddings**0.5
