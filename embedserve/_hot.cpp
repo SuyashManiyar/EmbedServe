@@ -1,7 +1,9 @@
 // C++ LRU hot tier for TierManager.
 //
-// Rows live in one contiguous float buffer of capacity * dim floats. An
-// open-addressing hash map takes a (table, row id) key to a slot, and an
+// Rows live in one contiguous buffer of fixed-width records. A record is either
+// dim FP32 values, or dim INT8 values followed by one FP32 scale; INT8 records
+// are dequantized (value * scale) as they are copied out. An open-addressing
+// hash map takes a (table, row id) key to a slot, and an
 // intrusive doubly linked list over slots keeps LRU order. lookup() runs the
 // whole per-ID pass of a batch in C++ for any mix of tables: hot hits are copied
 // into the output, and each distinct missing key is recorded once with the
@@ -98,15 +100,18 @@ private:
 
 using IdArray = py::array_t<std::int64_t, py::array::c_style | py::array::forcecast>;
 using RowArray = py::array_t<float, py::array::c_style | py::array::forcecast>;
+using RecordArray = py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast>;
 using MaskArray = py::array_t<bool, py::array::c_style | py::array::forcecast>;
 
 class HotTier {
 public:
-    HotTier(std::int64_t capacity, std::int64_t dim)
-        : capacity_(check_capacity(capacity)), dim_(dim),
+    HotTier(std::int64_t capacity, std::int64_t dim, bool quantized)
+        : capacity_(check_capacity(capacity)), dim_(dim), quantized_(quantized),
+          width_(quantized ? dim + static_cast<std::int64_t>(sizeof(float))
+                           : dim * static_cast<std::int64_t>(sizeof(float))),
           index_(static_cast<std::size_t>(capacity)) {
         if (dim <= 0) throw std::invalid_argument("dim must be positive");
-        rows_.resize(static_cast<std::size_t>(capacity * dim));
+        rows_.resize(static_cast<std::size_t>(capacity * width_));
         keys_.resize(capacity);
         prev_.resize(capacity);
         next_.resize(capacity);
@@ -136,7 +141,7 @@ public:
                 const std::int32_t s = index_.find(key);
                 if (s != kNone) {
                     touch(s);
-                    std::memcpy(o + i * dim_, slot_row(s), sizeof(float) * dim_);
+                    read_row(s, o + i * dim_);
                     ++hits;
                     continue;
                 }
@@ -157,28 +162,30 @@ public:
                               to_array(fill_pos), to_array(fill_slot));
     }
 
-    // Insert rows in order, skipping entries whose found flag is false.
-    void put_batch(IdArray tables_in, IdArray ids_in, RowArray rows_in, MaskArray found_in) {
+    // Insert records in order, skipping entries whose found flag is false.
+    void put_batch(IdArray tables_in, IdArray ids_in, RecordArray rows_in, MaskArray found_in) {
         const auto m = ids_in.ndim() == 1 ? ids_in.shape(0) : -1;
         if (m < 0 || tables_in.ndim() != 1 || tables_in.shape(0) != m || rows_in.ndim() != 2 ||
-            rows_in.shape(0) != m || rows_in.shape(1) != dim_ || found_in.ndim() != 1 ||
+            rows_in.shape(0) != m || rows_in.shape(1) != width_ || found_in.ndim() != 1 ||
             found_in.shape(0) != m)
             throw std::invalid_argument(
-                "put_batch expects tables (m,), ids (m,), rows (m, dim), found (m,)");
+                "put_batch expects tables (m,), ids (m,), records (m, width), found (m,)");
         if (capacity_ == 0) return;
         const std::int64_t* tables = tables_in.data();
         const std::int64_t* ids = ids_in.data();
-        const float* rows = rows_in.data();
+        const std::uint8_t* rows = rows_in.data();
         const bool* found = found_in.data();
         py::gil_scoped_release release;
         for (py::ssize_t i = 0; i < m; ++i)
-            if (found[i]) put(make_key(tables[i], ids[i]), rows + i * dim_);
+            if (found[i]) put(make_key(tables[i], ids[i]), rows + i * width_);
     }
 
     std::int64_t size() const { return static_cast<std::int64_t>(index_.size()); }
     std::int64_t capacity() const { return capacity_; }
     std::int64_t dim() const { return dim_; }
-    std::int64_t nbytes() const { return size() * dim_ * static_cast<std::int64_t>(sizeof(float)); }
+    std::int64_t width() const { return width_; }
+    bool quantized() const { return quantized_; }
+    std::int64_t nbytes() const { return size() * width_; }
 
 private:
     static std::int64_t check_capacity(std::int64_t capacity) {
@@ -187,7 +194,21 @@ private:
         return capacity;
     }
 
-    float* slot_row(std::int32_t s) { return rows_.data() + static_cast<std::size_t>(s) * dim_; }
+    std::uint8_t* slot_row(std::int32_t s) {
+        return rows_.data() + static_cast<std::size_t>(s) * width_;
+    }
+
+    void read_row(std::int32_t s, float* out) {
+        const std::uint8_t* record = slot_row(s);
+        if (!quantized_) {
+            std::memcpy(out, record, static_cast<std::size_t>(width_));
+            return;
+        }
+        float scale;
+        std::memcpy(&scale, record + dim_, sizeof(float));
+        const auto* q = reinterpret_cast<const std::int8_t*>(record);
+        for (std::int64_t d = 0; d < dim_; ++d) out[d] = static_cast<float>(q[d]) * scale;
+    }
 
     void unlink(std::int32_t s) {
         if (prev_[s] != kNone) next_[prev_[s]] = next_[s]; else head_ = next_[s];
@@ -207,7 +228,7 @@ private:
         push_back(s);
     }
 
-    void put(std::uint64_t key, const float* row) {
+    void put(std::uint64_t key, const std::uint8_t* record) {
         std::int32_t s = index_.find(key);
         if (s != kNone) {
             touch(s);
@@ -223,7 +244,7 @@ private:
             keys_[s] = key;
             push_back(s);
         }
-        std::memcpy(slot_row(s), row, sizeof(float) * dim_);
+        std::memcpy(slot_row(s), record, static_cast<std::size_t>(width_));
     }
 
     static py::array_t<std::int64_t> to_array(const std::vector<std::int64_t>& v) {
@@ -232,8 +253,10 @@ private:
         return a;
     }
 
-    std::int64_t capacity_, dim_, used_ = 0;
-    std::vector<float> rows_;
+    std::int64_t capacity_, dim_;
+    bool quantized_;
+    std::int64_t width_, used_ = 0;
+    std::vector<std::uint8_t> rows_;
     std::vector<std::uint64_t> keys_;
     std::vector<std::int32_t> prev_, next_;
     std::int32_t head_ = kNone, tail_ = kNone;
@@ -245,12 +268,15 @@ private:
 PYBIND11_MODULE(_hot, m) {
     m.doc() = "C++ LRU hot tier with batched lookup";
     py::class_<HotTier>(m, "HotTier")
-        .def(py::init<std::int64_t, std::int64_t>(), py::arg("capacity"), py::arg("dim"))
+        .def(py::init<std::int64_t, std::int64_t, bool>(), py::arg("capacity"), py::arg("dim"),
+             py::arg("quantized") = false)
         .def("lookup", &HotTier::lookup, py::arg("tables"), py::arg("ids"))
         .def("put_batch", &HotTier::put_batch, py::arg("tables"), py::arg("ids"),
-             py::arg("rows"), py::arg("found"))
+             py::arg("records"), py::arg("found"))
         .def("__len__", &HotTier::size)
         .def_property_readonly("capacity", &HotTier::capacity)
         .def_property_readonly("dim", &HotTier::dim)
+        .def_property_readonly("width", &HotTier::width)
+        .def_property_readonly("quantized", &HotTier::quantized)
         .def_property_readonly("nbytes", &HotTier::nbytes);
 }

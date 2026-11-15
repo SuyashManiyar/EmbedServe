@@ -90,3 +90,18 @@ def test_lookup_fields_uses_one_table_per_column(cold, backend):
     assert len(tm.hot) == 5
     with pytest.raises(ValueError):
         tm.lookup_fields(np.array([1, 2]))
+
+
+@pytest.mark.parametrize("row_format,width", [("fp32", 4 * DIM), ("int8", DIM + 4)])
+def test_record_round_trip(row_format, width):
+    from embedserve.quantize import dequantize_int8, quantize_int8
+    from embedserve.tiers import decode_records, encode_rows, record_width
+
+    rows = np.random.default_rng(5).normal(size=(6, DIM)).astype(np.float32)
+    rows[2] = 0  # an all-zero row keeps scale 1 and decodes to zeros
+    records = encode_rows(rows, row_format)
+    assert records.shape == (6, width) and records.dtype == np.uint8
+    assert record_width(DIM, row_format) == width
+    expected = rows if row_format == "fp32" else dequantize_int8(*quantize_int8(rows))
+    np.testing.assert_array_equal(decode_records(records, DIM, row_format), expected)
+    assert np.all(decode_records(np.zeros((2, width), np.uint8), DIM, row_format) == 0)

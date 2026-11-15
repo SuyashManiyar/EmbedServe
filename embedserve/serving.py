@@ -24,14 +24,25 @@ class EmbeddingStore:
             raise ValueError("tables must contain finite float32 values")
         self.table_sizes = [len(t) for t in tables]
 
+    @classmethod
+    def _bare(cls, table_sizes: list[int], dim: int):
+        """Instance with a known layout and no source tables to validate."""
+        if not table_sizes or dim <= 0 or any(n <= 0 for n in table_sizes):
+            raise ValueError("table sizes and dim must be positive")
+        store = cls.__new__(cls)
+        store.table_sizes = [int(n) for n in table_sizes]
+        store.dim = int(dim)
+        return store
+
     def validate_ids(self, ids: np.ndarray) -> None:
         if ids.ndim != 2 or ids.shape[1] != len(self.table_sizes):
             raise ValueError("IDs must have shape (batch, fields)")
         if not np.issubdtype(ids.dtype, np.integer):
             raise ValueError("IDs must be integers")
-        for j, size in enumerate(self.table_sizes):
-            if np.any(ids[:, j] < 0) or np.any(ids[:, j] >= size):
-                raise ValueError(f"row ID outside table {j} with {size} rows")
+        bad = (ids < 0) | (ids >= np.asarray(self.table_sizes))
+        if bad.any():
+            j = int(np.argmax(bad.any(axis=0)))
+            raise ValueError(f"row ID outside table {j} with {self.table_sizes[j]} rows")
 
     def lookup(self, ids: np.ndarray) -> np.ndarray:
         raise NotImplementedError
@@ -78,6 +89,13 @@ class INT8Store(EmbeddingStore):
         super().__init__(tables)
         self.tables = [quantize_int8(t) for t in tables]
 
+    @classmethod
+    def from_quantized(cls, tables: list[tuple[np.ndarray, np.ndarray]]):
+        """Build from (int8 rows, float32 row scales) pairs without the FP32 source."""
+        store = cls._bare([len(q) for q, _ in tables], tables[0][0].shape[1])
+        store.tables = tables
+        return store
+
     def lookup(self, ids: np.ndarray) -> np.ndarray:
         self.validate_ids(ids)
         return np.stack([
@@ -91,7 +109,11 @@ class INT8Store(EmbeddingStore):
 
 
 class TwoTierStore(EmbeddingStore):
-    """FP32 LRU rows backed by a temporary RocksDB database.
+    """LRU rows backed by a temporary RocksDB database.
+
+    Both tiers store rows as "fp32" or, with row_format="int8", as INT8 values
+    with one FP32 scale per row. INT8 rows are dequantized on lookup and give
+    the same output as INT8Store.
 
     One TierManager pass covers every field of the batch, with a single
     cold-tier fetch for all misses. Hits include duplicate IDs within a field
@@ -99,7 +121,7 @@ class TwoTierStore(EmbeddingStore):
     """
 
     def __init__(self, tables: list[np.ndarray], hot_capacity: int, db_root: Path,
-                 hot_backend: str = "python"):
+                 hot_backend: str = "python", row_format: str = "fp32"):
         super().__init__(tables)
         if hot_capacity < 0:
             raise ValueError("hot capacity must be nonnegative")
@@ -107,13 +129,30 @@ class TwoTierStore(EmbeddingStore):
         self._directory = TemporaryDirectory(prefix="eval-", dir=db_root)
         self.cold = None
         try:
-            self.cold = RocksDBColdTier(self._directory.name, self.dim)
+            self.cold = RocksDBColdTier(self._directory.name, self.dim, row_format)
             self.manager = TierManager(self.dim, hot_capacity, self.cold, hot_backend)
             for j, table in enumerate(tables):
                 self.manager.load(j, np.arange(len(table)), table)
         except BaseException:
             self.close()
             raise
+
+    @classmethod
+    def open(cls, path: Path, table_sizes: list[int], dim: int, hot_capacity: int,
+             hot_backend: str = "python", row_format: str = "fp32", mmap_reads: bool = True):
+        """Serve an existing database (see embedserve.export) read-only, loading no tables."""
+        if hot_capacity < 0:
+            raise ValueError("hot capacity must be nonnegative")
+        store = cls._bare(table_sizes, dim)
+        store._directory = None
+        store.cold = RocksDBColdTier(str(path), store.dim, row_format, read_only=True,
+                                     mmap_reads=mmap_reads)
+        try:
+            store.manager = TierManager(store.dim, hot_capacity, store.cold, hot_backend)
+        except BaseException:
+            store.close()
+            raise
+        return store
 
     def lookup(self, ids: np.ndarray) -> np.ndarray:
         self.validate_ids(ids)
@@ -138,6 +177,7 @@ class TwoTierStore(EmbeddingStore):
             "hot_rows": len(self.manager.hot),
             "hot_capacity": self.manager.hot.capacity,
             "hot_backend": self.manager.hot_backend,
+            "row_format": self.manager.row_format,
         }
 
     def close(self) -> None:
@@ -146,4 +186,5 @@ class TwoTierStore(EmbeddingStore):
                 self.cold.close()
                 self.cold = None
         finally:
-            self._directory.cleanup()
+            if self._directory is not None:
+                self._directory.cleanup()
