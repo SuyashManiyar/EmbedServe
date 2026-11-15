@@ -10,14 +10,16 @@ def tables():
     return [rng.normal(size=(n, 8)).astype(np.float32) for n in (5, 7)]
 
 
-@pytest.fixture(params=["fp32", "int8", "two-tier"])
+@pytest.fixture(params=["fp32", "int8", "two-tier", "two-tier-cpp"])
 def store(request, tables, tmp_path):
     if request.param == "fp32":
         obj = FP32Store(tables)
     elif request.param == "int8":
         obj = INT8Store(tables)
-    else:
+    elif request.param == "two-tier":
         obj = TwoTierStore(tables, 3, tmp_path)
+    else:
+        obj = TwoTierStore(tables, 3, tmp_path, hot_backend="cpp")
     with obj:
         yield obj
 

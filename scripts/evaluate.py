@@ -24,14 +24,14 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def run(args, data: CriteoArrays, mode: str, capacity: int | None) -> dict:
+def run(args, data: CriteoArrays, mode: str, capacity: int | None, backend: str | None) -> dict:
     model, tables = load_checkpoint(args.model)
     if mode == "fp32":
         store = FP32Store(tables)
     elif mode == "int8":
         store = INT8Store(tables)
     else:
-        store = TwoTierStore(tables, capacity, args.db_root)
+        store = TwoTierStore(tables, capacity, args.db_root, backend)
     del tables
     with store:
         return {
@@ -51,6 +51,10 @@ def main() -> None:
                    default=["fp32", "int8", "two-tier"])
     p.add_argument("--hot-capacities", nargs="+", type=int, default=[12574],
                    help="LRU row capacities for separate two-tier runs")
+    p.add_argument("--hot-backends", nargs="+", choices=["python", "cpp"], default=["python"],
+                   help="hot-tier implementations for separate two-tier runs")
+    p.add_argument("--repeats", type=int, default=1,
+                   help="times to repeat every configuration; repeats are interleaved")
     p.add_argument("--batch-size", type=int, default=2048)
     p.add_argument("--warmup-batches", type=int, default=0,
                    help="prefix batches replayed before measurement")
@@ -60,8 +64,8 @@ def main() -> None:
     args = p.parse_args()
     if args.rows is not None and args.rows <= 0:
         p.error("--rows must be positive")
-    if args.batch_size <= 0 or args.threads <= 0 or args.warmup_batches < 0:
-        p.error("batch size and threads must be positive and warmup must be nonnegative")
+    if args.batch_size <= 0 or args.threads <= 0 or args.warmup_batches < 0 or args.repeats <= 0:
+        p.error("batch size, threads and repeats must be positive and warmup must be nonnegative")
     if any(capacity < 0 for capacity in args.hot_capacities):
         p.error("hot capacities must be nonnegative")
     if args.out.resolve() in (args.model.resolve(), args.data.resolve()):
@@ -84,14 +88,20 @@ def main() -> None:
         "hit_rate_scope": "TierManager hits include duplicate IDs within each field batch",
         "runs": [],
     }
+    configs = []
     for mode in args.modes:
-        capacities = args.hot_capacities if mode == "two-tier" else [None]
-        for capacity in capacities:
-            result = run(args, data, mode, capacity)
+        if mode == "two-tier":
+            configs += [(mode, c, b) for c in args.hot_capacities for b in args.hot_backends]
+        else:
+            configs.append((mode, None, None))
+    for repeat in range(args.repeats):
+        for mode, capacity, backend in configs:
+            result = {"repeat": repeat, **run(args, data, mode, capacity, backend)}
             report["runs"].append(result)
-            print(f"{mode} capacity={capacity} rows={result['rows']:,} "
-                  f"AUC={result['auc']:.6f} payload={result['embedding_payload_bytes']:,} bytes",
-                  flush=True)
+            print(f"{mode} capacity={capacity} backend={backend} repeat={repeat} "
+                  f"rows={result['rows']:,} AUC={result['auc']:.6f} "
+                  f"lookup p50={result['lookup_batch_latency']['p50_ms']:.2f} ms "
+                  f"payload={result['embedding_payload_bytes']:,} bytes", flush=True)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     print(f"results: {args.out}")

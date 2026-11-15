@@ -93,11 +93,13 @@ class INT8Store(EmbeddingStore):
 class TwoTierStore(EmbeddingStore):
     """FP32 LRU rows backed by a temporary RocksDB database.
 
-    Each field issues a separate TierManager lookup. Hits include duplicate
-    IDs within a field batch, consistent with TierManager statistics.
+    One TierManager pass covers every field of the batch, with a single
+    cold-tier fetch for all misses. Hits include duplicate IDs within a field
+    batch, consistent with TierManager statistics.
     """
 
-    def __init__(self, tables: list[np.ndarray], hot_capacity: int, db_root: Path):
+    def __init__(self, tables: list[np.ndarray], hot_capacity: int, db_root: Path,
+                 hot_backend: str = "python"):
         super().__init__(tables)
         if hot_capacity < 0:
             raise ValueError("hot capacity must be nonnegative")
@@ -106,7 +108,7 @@ class TwoTierStore(EmbeddingStore):
         self.cold = None
         try:
             self.cold = RocksDBColdTier(self._directory.name, self.dim)
-            self.manager = TierManager(self.dim, hot_capacity, self.cold)
+            self.manager = TierManager(self.dim, hot_capacity, self.cold, hot_backend)
             for j, table in enumerate(tables):
                 self.manager.load(j, np.arange(len(table)), table)
         except BaseException:
@@ -115,9 +117,7 @@ class TwoTierStore(EmbeddingStore):
 
     def lookup(self, ids: np.ndarray) -> np.ndarray:
         self.validate_ids(ids)
-        out = np.stack([
-            self.manager.lookup(j, ids[:, j]) for j in range(len(self.table_sizes))
-        ], axis=1)
+        out = self.manager.lookup_fields(ids)
         if self.manager.not_found:
             raise RuntimeError("embedding row missing from the cold tier")
         return out
@@ -137,6 +137,7 @@ class TwoTierStore(EmbeddingStore):
             "not_found": self.manager.not_found,
             "hot_rows": len(self.manager.hot),
             "hot_capacity": self.manager.hot.capacity,
+            "hot_backend": self.manager.hot_backend,
         }
 
     def close(self) -> None:

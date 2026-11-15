@@ -56,6 +56,27 @@ Each two-tier run has a separate database under `--db-root`, which defaults to
 `data/evaluation-db`. The database closes and its temporary directory is
 removed when the run exits, including on evaluation errors.
 
+## Hot-tier backends
+
+`--hot-backends` selects one or both two-tier hot tier implementations. Each gets its own
+run at every capacity:
+
+- **`python`** (the default): an `OrderedDict` LRU, stepping through each ID in Python.
+- **`cpp`**: the compiled `embedserve._hot` extension, which runs the per-ID pass of the
+  whole batch in C++.
+
+Both backends share the cold-tier fetch and the step that fills fetched rows into the
+output. They give identical rows, hit and miss counts and LRU contents (checked in
+`tests/test_hot_cpp.py`), so only latency differs. Each run reports its backend as
+`hot_backend`.
+
+## Repeats
+
+`--repeats N` runs every configuration N times and records each as a separate run with a
+`repeat` index. The order is interleaved: all configurations run once, then all run again.
+`scripts/plot_results.py` merges repeats, reporting the median of each latency statistic
+and its range.
+
 ## Measurements
 
 AUC and log loss cover every selected row once, including the final partial
@@ -64,8 +85,9 @@ batch settings. INT8 predictions include per-row quantization error.
 
 `lookup_batch_latency` measures the complete lookup across all fields. It
 includes ID validation, row assembly and INT8 dequantization where applicable.
-The two-tier store calls `TierManager.lookup` once per field, with a separate
-cold-tier multi-get for each field that has misses.
+The two-tier store calls `TierManager.lookup_fields` once per batch. IDs are
+visited row by row, and the misses of every field are fetched with one cold-tier
+multi-get, then promoted into the LRU after the whole batch has been looked up.
 
 `inference_batch_latency` includes lookup, conversion of retrieved rows to a
 tensor, the DLRM forward pass and sigmoid. It excludes input file loading,
