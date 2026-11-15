@@ -16,15 +16,20 @@ def cold(request, tmp_path):
         tier.close()
 
 
-def make(cold, hot_capacity, n_rows=50):
+@pytest.fixture(params=["python", "cpp"])
+def backend(request):
+    return request.param
+
+
+def make(cold, hot_capacity, n_rows=50, backend="python"):
     rows = np.random.default_rng(0).normal(size=(n_rows, DIM)).astype(np.float32)
-    tm = TierManager(DIM, hot_capacity, cold)
+    tm = TierManager(DIM, hot_capacity, cold, backend)
     tm.load(0, np.arange(n_rows), rows)
     return tm, rows
 
 
-def test_lookup_returns_rows_and_counts_hits(cold):
-    tm, rows = make(cold, hot_capacity=10)
+def test_lookup_returns_rows_and_counts_hits(cold, backend):
+    tm, rows = make(cold, backend=backend, hot_capacity=10)
     out = tm.lookup(0, [3, 4, 3])  # second 3 reuses the first fetch
     np.testing.assert_array_equal(out, rows[[3, 4, 3]])
     assert (tm.hits, tm.misses) == (1, 2)
@@ -32,18 +37,18 @@ def test_lookup_returns_rows_and_counts_hits(cold):
     assert (tm.hits, tm.misses) == (3, 2)
 
 
-def test_missing_rows_are_zero(cold):
-    tm, _ = make(cold, hot_capacity=10)
+def test_missing_rows_are_zero(cold, backend):
+    tm, _ = make(cold, backend=backend, hot_capacity=10)
     assert np.all(tm.lookup(0, [999]) == 0) and tm.not_found == 1
 
 
-def test_tables_are_separate(cold):
-    tm, _ = make(cold, hot_capacity=10)
+def test_tables_are_separate(cold, backend):
+    tm, _ = make(cold, backend=backend, hot_capacity=10)
     assert np.all(tm.lookup(1, [3]) == 0)
 
 
-def test_lru_eviction(cold):
-    tm, _ = make(cold, hot_capacity=2)
+def test_lru_eviction(cold, backend):
+    tm, _ = make(cold, backend=backend, hot_capacity=2)
     tm.lookup(0, [1, 2])
     tm.lookup(0, [1])  # 1 is now most recent
     tm.lookup(0, [3])  # evicts 2
@@ -53,15 +58,35 @@ def test_lru_eviction(cold):
     assert len(tm.hot) == 2
 
 
-def test_skewed_access_has_high_hit_rate(cold):
-    tm, rows = make(cold, hot_capacity=10, n_rows=1000)
+def test_skewed_access_has_high_hit_rate(cold, backend):
+    tm, rows = make(cold, backend=backend, hot_capacity=10, n_rows=1000)
     ids = np.random.default_rng(1).zipf(1.5, size=5000) % 1000
     out = tm.lookup(0, ids)
     np.testing.assert_array_equal(out, rows[ids])
     assert tm.hit_rate > 0.7
 
 
-def test_load_shape_check(cold):
-    tm = TierManager(DIM, 4, cold)
+def test_load_shape_check(cold, backend):
+    tm = TierManager(DIM, 4, cold, backend)
     with pytest.raises(ValueError):
         tm.load(0, [1, 2], np.zeros((1, DIM), dtype=np.float32))
+
+
+def test_lookup_fields_uses_one_table_per_column(cold, backend):
+    rng = np.random.default_rng(2)
+    data = rng.normal(size=(3, 20, DIM)).astype(np.float32)
+    tm = TierManager(DIM, 5, cold, backend)
+    for t in range(3):
+        tm.load(t, np.arange(20), data[t])
+    ids = np.array([[1, 1, 7], [1, 4, 7], [2, 1, 30]])
+    out = tm.lookup_fields(ids)
+    assert out.shape == (3, 3, DIM)
+    for j in range(3):
+        ok = ids[:, j] < 20
+        np.testing.assert_array_equal(out[ok, j], data[j][ids[ok, j]])
+    assert np.all(out[2, 2] == 0)
+    # distinct keys: (0,1) (0,2) (1,1) (1,4) (2,7) (2,30); three repeats count as hits
+    assert (tm.hits, tm.misses, tm.not_found) == (3, 6, 1)
+    assert len(tm.hot) == 5
+    with pytest.raises(ValueError):
+        tm.lookup_fields(np.array([1, 2]))

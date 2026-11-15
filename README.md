@@ -14,21 +14,36 @@ one costs in memory, latency and accuracy.
 - **INT8 tables** use 26.6% of the FP32 memory and change AUC by 2×10⁻⁶.
 - **Two-tier serving** is exact (same AUC as FP32) and reaches a 94% hit rate with 5% of rows
   in memory (16 MB instead of 322 MB).
-- **Python-only lookups are the current bottleneck:** two-tier lookups are 7–12× slower than
-  FP32 in RAM, whatever the hit rate. See [Results](#results).
+- **The C++ hot tier cuts lookup latency by up to 5.6×.** With a 20% hot tier (64 MB), a
+  batch lookup takes 6.8 ms, compared with 37.7 ms for the Python hot tier and 4.6 ms with
+  every FP32 table in RAM (322 MB). See [Results](#results).
 
 ## How it works
 
 ```
 batch of IDs ─► TierManager
-                 ├─ hot tier: in-memory LRU of FP32 rows
-                 └─ cold tier: RocksDB on disk, one batched multi-get per field for all misses
+                 ├─ hot tier: in-memory LRU of FP32 rows (C++ or Python)
+                 └─ cold tier: RocksDB on disk, one multi-get per batch for all misses
 ```
 
 - **Stores** (`embedserve/serving.py`) share one `lookup(ids) -> (batch, fields, dim)` interface:
   - `FP32Store`: every table in RAM.
   - `INT8Store`: INT8 tables with one FP32 scale per row, dequantized on lookup.
-  - `TwoTierStore`: an LRU hot tier backed by RocksDB.
+  - `TwoTierStore`: an LRU hot tier backed by RocksDB. One pass covers every field of a
+    batch: hot hits are copied out, each distinct missing row is fetched once, and all misses
+    go to RocksDB in a single multi-get.
+- **Hot tier** (`embedserve/tiers.py`, `embedserve/_hot.cpp`): two interchangeable LRU
+  implementations that return identical rows and statistics.
+  - `python`: an `OrderedDict`, one Python step per ID.
+  - `cpp`: a pybind11 extension. It stores rows in one contiguous buffer, with an
+    open-addressing hash index and an intrusive LRU list, and runs the per-ID pass of a
+    whole batch in C++ without holding the GIL.
+
+  Everything outside the hot tier is shared by both: the RocksDB fetch, key encoding and the
+  array operation that fills in fetched rows.
+- **Cold tier** (`embedserve/tiers.py`): RocksDB with compression off, because float rows
+  don't compress, and SST files read through mmap. In a side test on this dataset these two
+  settings cut two-tier lookup p50 by 10–23% compared with RocksDB's defaults.
 - **Model** (`embedserve/model.py`): a standard DLRM. A bottom MLP (13→512→256→64) processes
   the dense features. There are 26 embedding tables of dimension 64. The pairwise dot products
   of all 27 vectors (351) plus the bottom output feed a top MLP (415→512→256→1).
@@ -42,7 +57,7 @@ batch of IDs ─► TierManager
 
 ### 1. Install
 
-Requires Python 3.10+. Developed on Python 3.14, macOS, CPU only.
+Requires Python 3.10+ and a C++17 compiler. Developed on Python 3.14, macOS, CPU only.
 
 ```bash
 git clone https://github.com/SuyashManiyar/EmbedServe.git && cd EmbedServe
@@ -58,6 +73,9 @@ pytest
 | `plots` | matplotlib | plotting results |
 
 The tests use synthetic data and don't need the dataset.
+
+`pip install -e .` also compiles the C++ hot tier (`embedserve/_hot.cpp`). If you edit the C++
+source, run the install again to rebuild it.
 
 ### 2. Get the data
 
@@ -126,17 +144,24 @@ validation rows. The report goes to `experiments/results/evaluation.json`.
 
 - Omit `--rows` to use the full validation file.
 - Pass several values to `--hot-capacities` to sweep cache sizes.
+- `--hot-backends python cpp` runs the two-tier store with each hot-tier implementation.
+  The default is `python` only.
+- `--repeats N` repeats every configuration N times. Repeats are interleaved, so slow
+  periods on the machine affect all configurations alike.
 
 ### 6. Reproduce the results
 
 ```bash
-python scripts/evaluate.py --hot-capacities 0 1257 12574 62868 125736 251472 \
+CAPS="0 1257 12574 62868 125736 251472"
+python scripts/evaluate.py --hot-backends python cpp --warmup-batches 49 --repeats 3 \
+  --hot-capacities $CAPS --out experiments/results/full-warmup49.json
+python scripts/evaluate.py --modes two-tier --hot-backends cpp --hot-capacities $CAPS \
   --out experiments/results/full-warmup0.json
-python scripts/evaluate.py --modes two-tier --warmup-batches 49 \
-  --hot-capacities 0 1257 12574 62868 125736 251472 \
-  --out experiments/results/full-warmup49.json
-python scripts/plot_results.py experiments/results/full-warmup0.json experiments/results/full-warmup49.json
+python scripts/plot_results.py experiments/results/full-warmup49.json experiments/results/full-warmup0.json
 ```
+
+In zsh, write `${=CAPS}` instead of `$CAPS` so the capacities split into separate arguments.
+The first command runs 42 evaluations of the full validation set, so it is the slow one.
 
 Each two-tier run builds a fresh RocksDB database before timing starts. The plots and a
 Markdown table are written to `experiments/plots/`.
@@ -177,16 +202,30 @@ How to read the table:
 - The full table, with log loss and end-to-end latency, is in
   [experiments/plots/results.md](experiments/plots/results.md).
 
-| Store | Hot tier | Payload | AUC | Hit rate (no warmup / 49 warmup) | Lookup p50 / p99 ms (49 warmup) |
-|---|---|---|---|---|---|
-| FP32 in RAM | all | 321.9 MB | 0.799600 | — | 4.0 / 6.3 (no warmup) |
-| INT8 in RAM | all | 85.5 MB (26.6%) | 0.799598 | — | 5.1 / 6.9 (no warmup) |
-| Two-tier | 0 | 0 MB | 0.799600 | 77.3% / 77.3% | 39.1 / 42.9 |
-| Two-tier | 0.1% | 0.3 MB | 0.799600 | 77.3% / 77.3% | 42.7 / 65.1 |
-| Two-tier | 1% | 3.2 MB | 0.799600 | 85.8% / 85.9% | 40.5 / 45.1 |
-| Two-tier | 5% | 16.1 MB | 0.799600 | 93.9% / 94.0% | 44.7 / 310.7 |
-| Two-tier | 10% | 32.2 MB | 0.799600 | 96.1% / 96.3% | 48.8 / 203.6 |
-| Two-tier | 20% | 64.4 MB | 0.799600 | 97.4% / 98.0% | 30.4 / 42.4 |
+| Store | Hot tier | Payload | AUC | Hit rate (no warmup / 49 warmup) |
+|---|---|---|---|---|
+| FP32 in RAM | all | 321.9 MB | 0.799600 | — |
+| INT8 in RAM | all | 85.5 MB (26.6%) | 0.799598 | — |
+| Two-tier | 0 | 0 MB | 0.799600 | 77.3% / 77.3% |
+| Two-tier | 0.1% | 0.3 MB | 0.799600 | 77.9% / 77.9% |
+| Two-tier | 1% | 3.2 MB | 0.799600 | 85.9% / 86.0% |
+| Two-tier | 5% | 16.1 MB | 0.799600 | 94.0% / 94.1% |
+| Two-tier | 10% | 32.2 MB | 0.799600 | 96.1% / 96.3% |
+| Two-tier | 20% | 64.4 MB | 0.799600 | 97.5% / 98.0% |
+
+Both hot-tier backends give the same AUC and hit rates. Batch lookup latency is below, as
+p50 / p99 in ms. Each value is the median of 3 interleaved runs with 49 warmup batches.
+
+| Store | Hot tier | Python hot tier | C++ hot tier | C++ speedup at p50 |
+|---|---|---|---|---|
+| FP32 in RAM | all | 4.6 / 8.4 | | |
+| INT8 in RAM | all | 6.8 / 8.4 | | |
+| Two-tier | 0 | 48.7 / 54.7 | 27.5 / 42.1 | 1.8× |
+| Two-tier | 0.1% | 57.6 / 74.4 | 28.2 / 39.7 | 2.0× |
+| Two-tier | 1% | 52.8 / 60.8 | 19.2 / 21.9 | 2.8× |
+| Two-tier | 5% | 44.3 / 70.1 | 11.3 / 21.1 | 3.9× |
+| Two-tier | 10% | 40.8 / 53.9 | 8.7 / 10.9 | 4.7× |
+| Two-tier | 20% | 37.7 / 47.8 | 6.8 / 10.4 | 5.6× |
 
 ![Hit rate vs hot-tier size](experiments/plots/hit_rate_vs_hot_size.png)
 ![Lookup latency vs hot-tier size](experiments/plots/lookup_latency_vs_hot_size.png)
@@ -203,27 +242,37 @@ How to read the table:
 
   | Hot tier | Hit rate |
   |---|---|
-  | 0.1% of rows | no change (77.3%) |
+  | 0.1% of rows | 77.9% |
   | 1% | 86% |
   | 5% | 94% |
-  | 20% | 97–98% |
+  | 20% | 98% |
 
   These hit rates are measured differently from the access-skew table, which counts every
   lookup separately, so the two tables aren't directly comparable.
 - **Warmup barely matters.** The LRU fills early in a 489-batch pass, so 49 warmup batches
   raise hit rates by at most 0.6 points.
-- **Two-tier lookups are 7–12× slower than FP32 at the median, whatever the hit rate.** The
-  p50 stays between 30 and 49 ms from 0% to 20% of rows in the hot tier. The cost is mostly
-  the Python loop in `TierManager.lookup`, which handles each of the 2,048 × 26 IDs in a batch
-  one at a time. The RocksDB reads are a smaller part. A vectorized or native hot tier is
-  needed before the cache pays off in latency.
-- **p99 is noisy.** Each configuration was run once, and the slowest batches vary between
-  runs. For example, the 5% hot tier's p99 was 79 ms without warmup and 311 ms with it. Treat
-  p99 differences under about 3× as noise.
+- **With the Python hot tier, a bigger cache helps little.** The p50 only falls from 48.7 ms
+  to 37.7 ms between no hot tier and 20% of rows, because most of the cost is the Python
+  loop that handles each of the 2,048 × 26 IDs in a batch one at a time.
+- **The C++ hot tier makes the cache pay off.** Its p50 falls from 27.5 ms with no hot tier
+  to 11.3 ms at 5% and 6.8 ms at 20%. The speedup over the Python hot tier grows with the
+  cache, from 1.8× to 5.6×, and comes from the hot tier alone because the rest of the lookup
+  path is shared.
+- **The gap to FP32 is down to 1.5×.** At 20%, a two-tier batch takes 6.8 ms against 4.6 ms
+  with all tables in RAM, using 64 MB of embeddings instead of 322 MB. At 10% (32 MB) it
+  takes 8.7 ms. What's left is mostly the RocksDB read of each missing row, about 2 µs per
+  row.
+- **p99 is still noisy at small hot tiers.** Across the 3 runs, p99 ranged from 32 to 106 ms
+  for the C++ hot tier with no cache, and from 54 to 222 ms for Python. From 10% up, the
+  C++ p99 stayed within 10–12 ms. The range for every configuration is in
+  [experiments/plots/results.md](experiments/plots/results.md).
+- **Compare numbers within one run only.** Latency on this laptop drifts between sessions.
+  The FP32 end-to-end p50 was 20 ms in an earlier session and 26 ms in this one, which is why
+  every configuration here was measured in the same interleaved run.
 
 ## Roadmap
 
-- Vectorized hot-tier lookup, then a C++ hot tier via pybind11, compared against the Python one
+- Cheaper cold reads: fetch missing rows straight into the output buffer from C++ instead of through Python bytes objects
 - Store INT8 rows in the tiers directly instead of keeping FP32 rows in the LRU
 - Eviction policy comparison: LRU vs frequency-based
 - Repeated runs with confidence intervals for tail latency
@@ -239,7 +288,8 @@ How to read the table:
 
 ```
 embedserve/
-  tiers.py          Hot tier, cold tiers (in-memory and RocksDB), TierManager
+  tiers.py          Python hot tier, cold tiers (in-memory and RocksDB), TierManager
+  _hot.cpp          C++ LRU hot tier with batched lookup (pybind11)
   quantize.py       FP32 → INT8 quantizer with a per-row scale
   serving.py        FP32, INT8 and two-tier embedding stores
   evaluation.py     Accuracy and batch latency measurements
@@ -250,6 +300,7 @@ scripts/
   train.py          Train the DLRM; saves weights and FP32 tables to data/model/
   evaluate.py       Evaluate a checkpoint across embedding stores
   plot_results.py   Plots and a Markdown table from evaluate.py reports
+setup.py            Builds the C++ extension; package metadata is in pyproject.toml
 docs/               Evaluation commands and metric definitions
 experiments/plots/  Plots and results table (raw reports go to the ignored experiments/results/)
 tests/              pytest suite on synthetic data
