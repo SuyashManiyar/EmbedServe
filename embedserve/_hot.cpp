@@ -7,8 +7,10 @@
 // intrusive doubly linked list over slots keeps LRU order. lookup() runs the
 // whole per-ID pass of a batch in C++ for any mix of tables: hot hits are copied
 // into the output, and each distinct missing key is recorded once with the
-// output positions it must fill. Python fetches the misses from the cold tier
-// and hands them back through put_batch().
+// output positions it must fill. complete() then takes the cold records (one
+// bytes object or None per miss) and writes them straight into those output
+// positions, promoting found rows into the LRU with one copy. There is no
+// intermediate record array and no second decoded copy.
 //
 // Semantics match the Python HotTier + TierManager exactly: a repeated key that
 // missed earlier in the same batch counts as a hit, a hot hit moves the row to
@@ -180,6 +182,64 @@ public:
             if (found[i]) put(make_key(tables[i], ids[i]), rows + i * width_);
     }
 
+    // Decode cold records directly into the miss positions of `out` (the array
+    // lookup() returned) and promote found rows. `values` has one entry per miss:
+    // a bytes record of `width` bytes, or None when the cold tier has no such row.
+    // None writes a zero row and is not cached. Returns how many values were None.
+    std::int64_t complete(RowArray out, IdArray miss_tables, IdArray miss_ids, py::list values,
+                          IdArray fill_pos, IdArray fill_slot) {
+        const auto m = miss_ids.ndim() == 1 ? miss_ids.shape(0) : -1;
+        const auto f = fill_pos.ndim() == 1 ? fill_pos.shape(0) : -1;
+        if (m < 0 || miss_tables.ndim() != 1 || miss_tables.shape(0) != m ||
+            static_cast<py::ssize_t>(values.size()) != m || f < 0 || fill_slot.ndim() != 1 ||
+            fill_slot.shape(0) != f || out.ndim() != 2 || out.shape(1) != dim_)
+            throw std::invalid_argument(
+                "complete expects out (n, dim), misses (m,), values (m,), fill (f,)");
+        const auto n = out.shape(0);
+        const std::int64_t* pos = fill_pos.data();
+        const std::int64_t* slot = fill_slot.data();
+        for (py::ssize_t k = 0; k < f; ++k)
+            if (pos[k] < 0 || pos[k] >= n || slot[k] < 0 || slot[k] >= m)
+                throw std::out_of_range("complete: fill index out of range");
+
+        struct Src {
+            const std::uint8_t* data;
+            bool found;
+        };
+        std::vector<Src> src(static_cast<std::size_t>(m));
+        std::int64_t not_found = 0;
+        for (py::ssize_t i = 0; i < m; ++i) {
+            PyObject* item = PyList_GET_ITEM(values.ptr(), i);
+            if (item == Py_None) {
+                src[static_cast<std::size_t>(i)] = {nullptr, false};
+                ++not_found;
+                continue;
+            }
+            if (!PyBytes_Check(item) || PyBytes_GET_SIZE(item) != width_)
+                throw std::invalid_argument("complete: each cold record must be width bytes or None");
+            src[static_cast<std::size_t>(i)] = {
+                reinterpret_cast<const std::uint8_t*>(PyBytes_AS_STRING(item)), true};
+        }
+
+        const std::int64_t* tables = miss_tables.data();
+        const std::int64_t* ids = miss_ids.data();
+        float* o = out.mutable_data();
+        {
+            py::gil_scoped_release release;
+            for (py::ssize_t k = 0; k < f; ++k) {
+                float* dst = o + pos[k] * dim_;
+                const Src& s = src[static_cast<std::size_t>(slot[k])];
+                if (s.found) decode(s.data, dst);
+                else std::memset(dst, 0, static_cast<std::size_t>(dim_) * sizeof(float));
+            }
+            if (capacity_ != 0)
+                for (py::ssize_t i = 0; i < m; ++i)
+                    if (src[static_cast<std::size_t>(i)].found)
+                        put(make_key(tables[i], ids[i]), src[static_cast<std::size_t>(i)].data);
+        }
+        return not_found;
+    }
+
     std::int64_t size() const { return static_cast<std::int64_t>(index_.size()); }
     std::int64_t capacity() const { return capacity_; }
     std::int64_t dim() const { return dim_; }
@@ -198,8 +258,7 @@ private:
         return rows_.data() + static_cast<std::size_t>(s) * width_;
     }
 
-    void read_row(std::int32_t s, float* out) {
-        const std::uint8_t* record = slot_row(s);
+    void decode(const std::uint8_t* record, float* out) const {
         if (!quantized_) {
             std::memcpy(out, record, static_cast<std::size_t>(width_));
             return;
@@ -209,6 +268,8 @@ private:
         const auto* q = reinterpret_cast<const std::int8_t*>(record);
         for (std::int64_t d = 0; d < dim_; ++d) out[d] = static_cast<float>(q[d]) * scale;
     }
+
+    void read_row(std::int32_t s, float* out) { decode(slot_row(s), out); }
 
     void unlink(std::int32_t s) {
         if (prev_[s] != kNone) next_[prev_[s]] = next_[s]; else head_ = next_[s];
@@ -273,6 +334,8 @@ PYBIND11_MODULE(_hot, m) {
         .def("lookup", &HotTier::lookup, py::arg("tables"), py::arg("ids"))
         .def("put_batch", &HotTier::put_batch, py::arg("tables"), py::arg("ids"),
              py::arg("records"), py::arg("found"))
+        .def("complete", &HotTier::complete, py::arg("out"), py::arg("miss_tables"),
+             py::arg("miss_ids"), py::arg("values"), py::arg("fill_pos"), py::arg("fill_slot"))
         .def("__len__", &HotTier::size)
         .def_property_readonly("capacity", &HotTier::capacity)
         .def_property_readonly("dim", &HotTier::dim)

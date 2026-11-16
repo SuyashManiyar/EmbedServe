@@ -65,10 +65,11 @@ run at every capacity:
 - **`cpp`**: the compiled `embedserve._hot` extension, which runs the per-ID pass of the
   whole batch in C++.
 
-Both backends share the cold-tier fetch and the step that fills fetched rows into the
-output. They give identical rows, hit and miss counts and LRU contents (checked in
-`tests/test_hot_cpp.py`), so only latency differs. Each run reports its backend as
-`hot_backend`.
+Both backends fetch misses from the same cold tier. The C++ backend decodes those
+records straight into the output and promotes them there; the Python backend fills
+the output with one array operation. They give identical rows, hit and miss counts
+and LRU contents (checked in `tests/test_hot_cpp.py`), so only latency differs.
+Each run reports its backend as `hot_backend`.
 
 ## Repeats
 
