@@ -2,8 +2,10 @@
 
 A lookup takes a whole batch of IDs. Pass 1 serves hot-tier hits; each distinct
 missing ID is fetched once, and repeats of it in the same batch count as hits.
-Pass 2 fetches all misses from the cold tier in one call, promotes them into
-the hot tier and fills the output with one array operation.
+Pass 2 fetches all misses from the cold tier in one call and promotes them into
+the hot tier. The Python backend then fills the output with one array operation.
+The C++ backend decodes those records straight into the output buffer and copies
+each found row into the hot tier once.
 
 `TierManager.lookup` handles one table. `TierManager.lookup_fields` handles a
 (batch, fields) ID matrix in a single pass, with one cold-tier fetch for the
@@ -16,8 +18,7 @@ INT8 records are dequantized as they are read.
 
 Two hot-tier backends give identical results and statistics: "python" (an
 OrderedDict LRU, one Python step per ID) and "cpp" (embedserve._hot, which runs
-pass 1 for the whole batch in C++). Everything else is shared, so a latency
-difference between them comes from the hot tier alone.
+both passes for the whole batch in C++). The cold-tier fetch is shared.
 """
 
 from __future__ import annotations
@@ -125,10 +126,13 @@ class InMemoryColdTier:
         for i, record in zip(ids.tolist(), records):
             self._rows[(table, i)] = record.tobytes()
 
+    def get_values(self, tables: np.ndarray, ids: np.ndarray) -> list[bytes | None]:
+        """Raw record for each key, or None when the key is absent."""
+        return [self._rows.get(k) for k in zip(tables.tolist(), ids.tolist())]
+
     def multi_get_records(self, tables: np.ndarray, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Fetch (len(ids), width) uint8 records plus a found mask; missing records are zero."""
-        values = [self._rows.get(k) for k in zip(tables.tolist(), ids.tolist())]
-        return _records_from_values(values, self.width)
+        return _records_from_values(self.get_values(tables, ids), self.width)
 
 
 class RocksDBColdTier:
@@ -169,9 +173,13 @@ class RocksDBColdTier:
         for key, record in zip(self._encode_many(table, ids), records):
             self._db[key] = record.tobytes()
 
+    def get_values(self, tables: np.ndarray, ids: np.ndarray) -> list[bytes | None]:
+        """Raw record for each key, or None when the key is absent. One multi-get."""
+        return self._db[self._encode_many(tables, ids)]
+
     def multi_get_records(self, tables: np.ndarray, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Fetch (len(ids), width) uint8 records plus a found mask; missing records are zero."""
-        return _records_from_values(self._db[self._encode_many(tables, ids)], self.width)
+        return _records_from_values(self.get_values(tables, ids), self.width)
 
     def finalize(self) -> None:
         """Flush and compact after an offline load, so a later open reads only SST files."""
@@ -251,11 +259,16 @@ class TierManager:
         self.misses += len(miss_ids)
         if len(fill_pos) == 0:
             return out
+        if self.hot_backend == "cpp":
+            # Cold records are bytes from the fetch. C++ decodes each one into
+            # the output rows that need it and copies it into the hot tier.
+            values = self.cold.get_values(miss_tables, miss_ids)
+            self.not_found += self.hot.complete(
+                out, miss_tables, miss_ids, values, fill_pos, fill_slot)
+            return out
         records, found = self.cold.multi_get_records(miss_tables, miss_ids)
         self.not_found += len(found) - int(np.count_nonzero(found))
-        if self.hot_backend == "cpp":
-            self.hot.put_batch(miss_tables, miss_ids, records, found)
-        elif self.hot.capacity:
+        if self.hot.capacity:
             for table, i, record, ok in zip(
                     miss_tables.tolist(), miss_ids.tolist(), records, found.tolist()):
                 if ok:

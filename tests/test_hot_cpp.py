@@ -95,6 +95,24 @@ def test_heavy_eviction_keeps_index_consistent():
         assert state(py) == state(cc)
 
 
+def test_cpp_cold_fill_int8_rocksdb_matches_python(tmp_path):
+    """Capacity 0 forces every distinct ID through the C++ cold fill, including a missing ID."""
+    py, _ = loaded(lambda: RocksDBColdTier(str(tmp_path / "py"), DIM, "int8"), 0, "python",
+                   tables=2, n_rows=16)
+    cc, _ = loaded(lambda: RocksDBColdTier(str(tmp_path / "cc"), DIM, "int8"), 0, "cpp",
+                   tables=2, n_rows=16)
+    try:
+        ids = np.array([1, 1, 3, 100, 3])
+        np.testing.assert_array_equal(cc.lookup(1, ids), py.lookup(1, ids))
+        assert np.all(cc.lookup(1, [100]) == 0)
+        py.lookup(1, [100])
+        assert state(py) == state(cc)
+        assert len(cc.hot) == 0 and py.not_found == 2
+    finally:
+        py.cold.close()
+        cc.cold.close()
+
+
 def test_rejects_bad_arguments():
     from embedserve import _hot
 
@@ -110,3 +128,6 @@ def test_rejects_bad_arguments():
         hot.lookup(zero, np.zeros(2, dtype=np.int64))
     with pytest.raises(ValueError):
         hot.put_batch(zero, zero, np.zeros((1, DIM + 1), np.float32), np.array([True]))
+    out = np.zeros((1, DIM), np.float32)
+    with pytest.raises(ValueError):
+        hot.complete(out, zero, zero, [b"short"], zero, zero)

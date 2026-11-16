@@ -43,7 +43,9 @@ requests ─► DynamicBatcher ─► TierManager ─► DLRM MLPs
   implementations that return identical rows and statistics.
   - `cpp`: a pybind11 extension. It stores records in one contiguous buffer, with an
     open-addressing hash index and an intrusive LRU list, and runs the per-ID pass of a
-    whole batch in C++ without holding the GIL.
+    whole batch in C++ without holding the GIL. Cold records come back from the fetch as
+    bytes; C++ decodes them straight into the output rows that missed and copies each
+    found row into the hot tier once.
   - `python`: an `OrderedDict`, one Python step per ID. Kept as the reference and baseline.
 - **Cold tier**: RocksDB with compression off, because embedding rows don't compress. SST
   files are read through mmap by default, which is faster but counts the mapped file pages in
@@ -366,7 +368,6 @@ sustained 31,400 req/s with it (p50 3.6 ms, p99 10.8 ms).
 
 ## Roadmap
 
-- Read cold rows straight into the output buffer from C++, instead of through Python bytes objects
 - Eviction policy comparison: LRU vs frequency-based
 - A network serving API (HTTP or gRPC) in front of the batcher, with the load generator in a separate process
 - Cold-disk measurements with the OS file cache dropped
